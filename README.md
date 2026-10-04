@@ -19,6 +19,8 @@ Uploads stream to disk with a 1 GB file limit. The progress bar measures bytes u
 
 Existing releases remain available after publishing an update. Select a pack in Manage packs to edit its name and description. Clicking a library card opens the pack's mods, versions, release notes, and download links.
 
+To delete a version, log in as an admin, open **Manage packs**, select **Update** for the pack, and scroll to **Manage releases**. Click **Delete** beside the version and confirm. This permanently removes its database record and ZIP from `UPLOAD_DIR`. The latest link falls back to the newest remaining release. Deleting the last release also removes the pack from the library. If storage refuses file deletion, the release is kept and an error is shown.
+
 The mod list comes from the ZIP directory: it lists JAR filenames, paths, and uncompressed sizes. JAR files are never extracted or executed by the app.
 
 ## Public links
@@ -41,6 +43,8 @@ Replace the placeholders with the actual URL copied from the pack page. Local pr
 
 Use a persistent Node.js host with writable `DATABASE_PATH` and `UPLOAD_DIR` directories. Set `NEXT_PUBLIC_SITE_URL=https://mods.paarthshaunik.gay`, build with `npm run build`, and run `npm start`. Back up both storage directories together.
 
+For Caddy, use the included [Caddyfile](Caddyfile) and follow [the setup guide](docs/caddy.md) for DNS, HTTPS, and reverse proxy configuration.
+
 If using a reverse proxy, allow upload request bodies of at least 1 GB plus multipart overhead (for example, Nginx `client_max_body_size 1100m;`) and allow sufficient upload/request time. Forward the public host using `Host` or `X-Forwarded-Host`; uploads validate the request origin.
 
 ZIPs are checked for a valid archive directory and excessive entry counts. This does not scan mods for malware; use trusted admin accounts.
@@ -51,7 +55,7 @@ ZIPs are checked for a valid archive directory and excessive entry counts. This 
 - `npm run lint`
 - `npm run test:uploads` after a build. The test uses isolated storage under `.qa-runtime`, port 3100, and an installed Chrome browser. Set `CHROME_PATH` if Chrome is elsewhere.
 
-The upload test covers a 110 MB ZIP, repeated submissions, concurrent retries, duplicate content and version checks, public downloads, mod inspection, pack edits, and mobile layouts.
+The upload test covers a 110 MB ZIP, repeated submissions, concurrent retries, duplicate content and version checks, public downloads, mod inspection, pack edits, and mobile layouts. It also verifies release deletion, ZIP removal, cancellation, storage failures, latest-link fallback, final-release cleanup, missing files, re-upload, and anonymous/member deletion denial.
 
 Generated local logo and favicon prompts are recorded in [docs/asset-prompts.md](docs/asset-prompts.md).
 

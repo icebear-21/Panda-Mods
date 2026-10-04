@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, open, readFile, readdir, rm } from "node:fs/promises";
+import { access, mkdir, open, readFile, readdir, rename, rm, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
@@ -134,6 +134,79 @@ try {
   }
   await page.goto(base + "/packs/" + groupId);
   await page.screenshot({ path: path.join(root, "detail-mobile.png"), fullPage: true });
+
+  // Verify destructive actions only touch isolated fixtures, including storage failures.
+  const second = db.prepare("SELECT * FROM packs WHERE id != ?").get(first.id);
+  const secondZip = path.join(uploads, second.stored_name);
+  await page.goto(base + "/admin?pack=" + groupId);
+  await page.getByRole("button", { name: "Delete version 2.0.0", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM packs").get().n, 2, "cancel must keep releases");
+  await access(secondZip);
+
+  // A directory at the ZIP path simulates a filesystem refusal on every platform.
+  await rename(secondZip, secondZip + ".backup");
+  await mkdir(secondZip);
+  await page.getByRole("button", { name: "Delete version 2.0.0", exact: true }).click();
+  const actionRequest = page.waitForRequest(req => req.method() === "POST" && !!req.headers()["next-action"]);
+  await dialog.getByRole("button", { name: "Delete permanently", exact: true }).click();
+  const deletionRequest = await actionRequest;
+  await dialog.getByRole("alert").filter({ hasText: "The release was kept." }).waitFor();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM packs").get().n, 2, "filesystem failure must keep the database record");
+  await rmdir(secondZip);
+  await rename(secondZip + ".backup", secondZip);
+  const actionHeaders = { Origin: base, "Next-Action": deletionRequest.headers()["next-action"], "Content-Type": deletionRequest.headers()["content-type"] };
+  const actionBody = deletionRequest.postDataBuffer();
+  const anonymousDelete = await fetch(base + "/admin?pack=" + groupId, { method: "POST", headers: actionHeaders, body: actionBody });
+  assert.match(await anonymousDelete.text(), /Admin login required to delete releases/);
+  assert.ok(db.prepare("SELECT id FROM packs WHERE id = ?").get(second.id), "anonymous action replay must not delete a release");
+  await access(secondZip);
+  await dialog.getByRole("button", { name: "Delete permanently", exact: true }).click();
+  await page.getByText("Release and ZIP deleted from storage.", { exact: true }).waitFor();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM packs").get().n, 1);
+  await assert.rejects(access(secondZip), { code: "ENOENT" });
+  assert.equal((await fetch(base + "/api/packs/" + second.id + "/download")).status, 404);
+  const fallback = await fetch(base + "/downloads/" + groupId + "/latest");
+  assert.equal(fallback.status, 200);
+  assert.equal(Number(fallback.headers.get("content-length")), first.size_bytes);
+  await fallback.body.cancel();
+  await page.goto(base + "/packs/" + groupId);
+  assert.equal(await page.getByRole("link", { name: "2.0.0", exact: true }).count(), 0);
+  await page.goto(base + "/admin?pack=" + groupId);
+  await page.getByRole("button", { name: "Delete version 1.0.0", exact: true }).click();
+  await dialog.getByText(/This is the last release/).waitFor();
+  await dialog.getByRole("button", { name: "Delete permanently", exact: true }).click();
+  await page.getByText("Last release and ZIP deleted. The pack was removed from the library.").waitFor();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM packs").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM pack_groups").get().n, 0);
+  await assert.rejects(access(path.join(uploads, first.stored_name)), { code: "ENOENT" });
+  assert.equal((await fetch(base + "/packs/" + groupId)).status, 404);
+  assert.equal((await fetch(base + "/downloads/" + groupId + "/latest")).status, 404);
+
+  // The same pack name/version can be published again after deletion.
+  const recreated = await upload("1.0.0", randomUUID(), "");
+  assert.equal(recreated.status(), 201);
+  const recreatedData = await recreated.json();
+  const recreatedRelease = db.prepare("SELECT * FROM packs WHERE id = ?").get(recreatedData.releaseId);
+  await page.goto(base + "/admin?pack=" + recreatedData.groupId);
+  // Missing ZIPs can still be removed from the database.
+  await unlink(path.join(uploads, recreatedRelease.stored_name));
+  await page.getByRole("button", { name: "Delete version 1.0.0", exact: true }).click();
+  await dialog.getByRole("button", { name: "Delete permanently", exact: true }).click();
+  await page.getByText("Last release and ZIP deleted. The pack was removed from the library.").waitFor();
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM packs").get().n, 0);
+  assert.equal((await readdir(uploads)).length, 0, "deletion must leave no ZIP or temporary files");
+
+  // Keep a release for the member authorization replay below.
+  const protectedUpload = await upload("1.0.0", randomUUID(), "");
+  assert.equal(protectedUpload.status(), 201);
+  const protectedData = await protectedUpload.json();
+  await page.goto(base + "/admin?pack=" + protectedData.groupId);
+  await page.getByRole("button", { name: "Delete version 1.0.0", exact: true }).click();
+  await page.screenshot({ path: path.join(root, "delete-mobile.png"), fullPage: true });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "Delete dialog must fit mobile");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   const publicContext = await browser.newContext();
   assert.equal((await publicContext.request.post(base + "/api/uploads", { headers: { Origin: base, "X-Upload-Key": randomUUID() } })).status(), 401);
   await publicContext.close();
@@ -147,7 +220,14 @@ try {
   await page.waitForURL(base + "/");
   await page.goto(base + "/admin");
   await page.waitForURL(base + "/login");
-  console.log("PASS: 110 MB streaming upload, visible progress, repeat submissions, concurrent retries, duplicate ZIPs, archive validation, grouped releases, mod inspection, release notes, public byte-identical downloads, metadata updates, and mobile layout.");
+  // Replay a real server action as a member, targeting an existing release.
+  const memberCookies = (await context.cookies()).map(cookie => cookie.name + "=" + cookie.value).join("; ");
+  const memberBody = Buffer.from(actionBody.toString().replaceAll(second.id, protectedData.releaseId).replaceAll(groupId, protectedData.groupId));
+  const memberDelete = await fetch(base + "/admin", { method: "POST", headers: { ...actionHeaders, Cookie: memberCookies }, body: memberBody });
+  assert.match(await memberDelete.text(), /Admin login required to delete releases/);
+  assert.ok(db.prepare("SELECT id FROM packs WHERE id = ?").get(protectedData.releaseId), "member action replay must not delete a release");
+  await access(path.join(uploads, protectedData.releaseId + ".zip"));
+  console.log("PASS: uploads, duplicate protection, mod inspection, public downloads, mobile layout, confirmed release/ZIP deletion, cancellation, latest fallback, last-release cleanup, storage failures, missing files, re-upload, and anonymous/member deletion denial.");
   console.log("QA screenshot directory: " + root);
 } catch (error) {
   console.error(log);

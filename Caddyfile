@@ -1,0 +1,5 @@
+# Run Caddy on the same host as the production Next.js server.
+mods.paarthshaunik.gay {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000
+}
